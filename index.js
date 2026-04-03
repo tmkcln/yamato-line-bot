@@ -6,11 +6,16 @@
  * 環境変数（Railway Dashboard で設定）:
  *   LINE_ACCESS_TOKEN          : LINE Channel Access Token
  *   DIFY_API_KEY               : Dify の API キー
- *   BOT_MENTION_NAME           : グループ内メンションキーワード（デフォルト: @YAMATO）
+ *   SLACK_WEBHOOK_URL          : Slack Incoming Webhook URL（notify_slack アクション用）
  *   GOOGLE_SERVICE_ACCOUNT_JSON: Service Account の JSON 全文
  *   GOOGLE_SHEETS_ID           : スプレッドシート ID
  *   GOOGLE_DRIVE_FOLDER_ID     : Drive ルートフォルダ ID
  *   PORT                       : Railway が自動設定
+ *
+ * Phase 3 変更点:
+ *   - 全テキストメッセージを Dify に送り、JSON形式でアクション判断を受け取る
+ *   - action: "ignore" / "reply" / "notify_slack" で動作を分岐
+ *   - メンション（@ymtbot）や DM判定は廃止。AI が全て判断する
  */
 
 const express = require('express');
@@ -24,7 +29,7 @@ app.use(express.json());
 const LINE_ACCESS_TOKEN   = process.env.LINE_ACCESS_TOKEN;
 const DIFY_API_KEY        = process.env.DIFY_API_KEY;
 const DIFY_BASE_URL       = 'https://api.dify.ai/v1';
-const BOT_MENTION_NAME    = process.env.BOT_MENTION_NAME || '@YAMATO';
+const SLACK_WEBHOOK_URL   = process.env.SLACK_WEBHOOK_URL;
 const SHEETS_ID           = process.env.GOOGLE_SHEETS_ID;
 const DRIVE_ROOT_FOLDER   = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const SHEET_NAME          = 'メッセージログ';
@@ -132,17 +137,9 @@ app.post('/', async (req, res) => {
 
       console.log(`[LOG] ${displayName}(${groupName}): ${text.substring(0, 60)}`);
 
-      // メンション or DM のみ Dify で返信
-      if (msg.type === 'text') {
-        const isDM       = sourceType === 'user';
-        const isMention  = text.includes(BOT_MENTION_NAME);
-        if (isDM || isMention) {
-          const clean = text.replace(new RegExp(BOT_MENTION_NAME + '\\s*', 'g'), '').trim();
-          if (clean) {
-            const reply = await callDify(clean, userId);
-            await replyToLine(replyToken, reply);
-          }
-        }
+      // 全テキストメッセージを AI に判断させる（Phase 3）
+      if (msg.type === 'text' && text) {
+        await handleAiDecision(text, replyToken, groupName, displayName, userId);
       }
     } catch (err) {
       console.error(`[ERROR] ${err.message}`);
@@ -267,6 +264,51 @@ async function getGroupName(groupId, sourceType) {
     nameCache[groupId] = groupId;
   }
   return nameCache[groupId];
+}
+
+// ── AI判断 + アクション分岐（Phase 3） ──
+async function handleAiDecision(text, replyToken, groupName, displayName, userId) {
+  // Dify に送るコンテキスト付きメッセージ（システムプロンプト側で活用）
+  const contextText = `[グループ: ${groupName}] [送信者: ${displayName}]\n${text}`;
+  const rawResponse = await callDify(contextText, userId);
+
+  let decision;
+  try {
+    // Dify がコードブロックで囲んで返す場合があるので除去
+    const cleaned = rawResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    decision = JSON.parse(cleaned);
+  } catch {
+    // JSON でない場合はそのままテキスト返信（移行期フォールバック）
+    console.warn('[AI] JSON parse 失敗。テキスト返信にフォールバック:', rawResponse.substring(0, 80));
+    decision = { action: 'reply', reply_text: rawResponse };
+  }
+
+  const action = decision.action || 'ignore';
+  console.log(`[AI] action=${action} urgency=${decision.urgency || '-'} category=${decision.category || '-'}`);
+
+  if (action === 'reply' && decision.reply_text && replyToken) {
+    await replyToLine(replyToken, decision.reply_text);
+  } else if (action === 'notify_slack') {
+    await notifySlack(decision.summary || text, decision.urgency || 'medium', groupName, displayName);
+  }
+  // action === 'ignore' は何もしない
+}
+
+// ── Slack 通知 ──
+async function notifySlack(summary, urgency, groupName, senderName) {
+  if (!SLACK_WEBHOOK_URL) {
+    console.warn('[Slack] SLACK_WEBHOOK_URL が未設定です');
+    return;
+  }
+  const emoji = urgency === 'high' ? '🚨' : urgency === 'medium' ? '⚠️' : 'ℹ️';
+  const slackText = `${emoji} *[${groupName}]* ${senderName}: ${summary}`;
+  const res = await fetch(SLACK_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: slackText }),
+  });
+  if (!res.ok) console.error('[Slack] 通知失敗:', res.status);
+  else console.log('[Slack] 通知送信:', slackText.substring(0, 60));
 }
 
 // ── Dify API ──
