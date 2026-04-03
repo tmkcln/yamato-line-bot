@@ -1,7 +1,7 @@
 {
   "name": "yamato-line-bot",
-  "version": "1.0.0",
-  "description": "YAMATO AI Bot - LINE + Dify integration",
+  "version": "2.0.0",
+  "description": "YAMATO AI Bot - LINE + Dify + Google Sheets/Drive integration",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,6 +10,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "googleapis": "^144.0.0"
   }
 }
