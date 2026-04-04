@@ -32,11 +32,8 @@ const SHEET = {
   THREAD_LOG: 'スレッドログ',
 };
 
-// NOISE正規表現（index.jsと同一）
-// 「はい、」（読点付き）は削除: 読点は文が続く証拠。後続内容を見ずに除外すると重要情報を失う
-// .{0,8} に短縮: 「でした！」「ます。」程度のみ許容
-// [^、]{0,8}: suffix に読点(、)を含まず最大8文字。読点があれば文が続く→通過させる
-const NOISE_REGEX_STR = '^(お疲れ様|おつかれ様|お疲れ様です|おつかれさまです|おつかれ|承知しました|承知いたしました|承知です|かしこまりました|かしこまりです|ありがとうございます|ありがとうございました|ご対応ありがとう|了解です|了解しました|了解いたしました|わかりました|はーい|よろしくお願いします)[^、]{0,8}$';
+// NOISEフィルタは廃止。全テキストをGeminiに渡し、スレッドコンテキストで正確に判断させる。
+// 正規表現フィルタは「はい、エアコンが壊れています」等の重要情報を誤除外するリスクがあった。
 
 // スレッド分割の閾値（分）
 const THREAD_GAP_MIN = 5;
@@ -129,7 +126,6 @@ function getLogMessages(ss, today) {
   if (data.length < 2) return [];
 
   // ヘッダー: 日時(0) グループID(1) グループ名(2) ユーザーID(3) 表示名(4) 種別(5) テキスト(6)
-  const noiseRegex = new RegExp(NOISE_REGEX_STR, 'u');
   const rows = [];
 
   for (let i = 1; i < data.length; i++) {
@@ -141,7 +137,7 @@ function getLogMessages(ss, today) {
 
     const text = String(data[i][6] || '').trim();
     if (!text) continue;
-    if (noiseRegex.test(text)) continue;  // NOISE除外
+    // NOISE判定はGeminiに委任（正規表現フィルタ廃止）
 
     rows.push({
       time:     dateStr.substring(11, 16),  // "HH:MM"

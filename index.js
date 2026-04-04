@@ -43,6 +43,39 @@ const CRITICAL_REGEX = /漏電|水漏れ|ガス漏れ|火災|煙が出|燃えて
 // [^、]{0,8}: suffix に読点(、)を含まず最大8文字。読点があれば文が続く→通過させる
 const NOISE_REGEX = /^(お疲れ様|おつかれ様|お疲れ様です|おつかれさまです|おつかれ|承知しました|承知いたしました|承知です|かしこまりました|かしこまりです|ありがとうございます|ありがとうございました|ご対応ありがとう|了解です|了解しました|了解いたしました|わかりました|はーい|よろしくお願いします)[^、]{0,8}$/u;
 
+// ── 1-c. グループ設定マスタ ──
+// groupId をキーに施設名・用途・Botの振る舞いを定義する。
+// 未登録グループは DEFAULT_GROUP_CONFIG にフォールバック。
+//
+// purpose の選択肢:
+//   'facility_ops'    — 清掃/設備/課金ログ（デフォルト）
+//   'staff_internal'  — 社内スタッフ連絡（将来: 出退勤のみ記録）
+//   'guest_support'   — ゲスト向けFAQ Bot（将来: RAG連携）
+//
+// botMode の選択肢:
+//   'passive' — グループ内で発言しない（デフォルト）
+//   'active'  — Geminiが reply_text を返したとき LINE Reply API で返信
+//
+// 新施設・Slack Bot・新グループを追加するときはここに行を追加するだけでよい。
+const GROUP_CONFIGS = {
+  // 富浦館山の groupId が判明したら下のコメントを外して設定する:
+  // 'C1234567890abcdef': {
+  //   facilityName: '富浦館山',
+  //   purpose: 'facility_ops',
+  //   botMode: 'passive',
+  // },
+};
+
+const DEFAULT_GROUP_CONFIG = {
+  facilityName: null,   // null のとき LINE Profile API のグループ名をそのまま使用
+  purpose: 'facility_ops',
+  botMode: 'passive',
+};
+
+function getGroupConfig(groupId) {
+  return GROUP_CONFIGS[groupId] || DEFAULT_GROUP_CONFIG;
+}
+
 // シート名定義
 const SHEETS = {
   LOG: 'メッセージログ',  // index.jsが書き込む唯一のシート（全量RAWログ）
