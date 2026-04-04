@@ -129,7 +129,11 @@ function getLogMessages(ss, today) {
   const rows = [];
 
   for (let i = 1; i < data.length; i++) {
-    const dateStr = String(data[i][0] || '');
+    // getValues() はタイムスタンプをDate型で返す場合があるため、JST文字列に変換
+    const raw = data[i][0];
+    const dateStr = raw instanceof Date
+      ? Utilities.formatDate(raw, 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss')
+      : String(raw || '');
     if (!dateStr.startsWith(today)) continue;
 
     const type = String(data[i][5] || '');
