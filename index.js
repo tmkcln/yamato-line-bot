@@ -543,11 +543,13 @@ async function uploadToDrive(messageId, fileName, msgType, groupName) {
     requestBody: { name: fileName, parents: [groupFolder] },
     media: { mimeType: contentType, body: stream },
     fields: 'id, webViewLink',
+    supportsAllDrives: true,
   });
 
   await drive.permissions.create({
     fileId: uploaded.data.id,
     requestBody: { role: 'reader', type: 'anyone' },
+    supportsAllDrives: true,
   });
 
   return uploaded.data.webViewLink;
@@ -561,6 +563,8 @@ async function getOrCreateFolder(drive, name, parentId) {
   const res = await drive.files.list({
     q: `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
     fields: 'files(id)',
+    includeItemsFromAllDrives: true,
+    supportsAllDrives: true,
   });
 
   let folderId;
@@ -570,6 +574,7 @@ async function getOrCreateFolder(drive, name, parentId) {
     const created = await drive.files.create({
       requestBody: { name, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] },
       fields: 'id',
+      supportsAllDrives: true,
     });
     folderId = created.data.id;
   }
