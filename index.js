@@ -1,23 +1,21 @@
 /**
- * YAMATO AI Bot — Railway版 (Express) v3
+ * YAMATO AI Bot — Railway版 (Express) v3.1
  *
- * 構成: LINE Webhook → Railway → Google Sheets/Drive 収集 + Dify AI分類 + Slack通知
+ * 構成: LINE Webhook → Railway → Google Sheets/Drive 収集 + Gemini AI分類 + Slack通知
  *
  * 環境変数（Railway Dashboard で設定）:
  *   LINE_ACCESS_TOKEN          : LINE Channel Access Token
- *   DIFY_API_KEY               : Dify の API キー
+ *   GEMINI_API_KEY             : Google Gemini API キー（aistudio.google.com で取得）
  *   SLACK_WEBHOOK_URL          : Slack Incoming Webhook URL（1チャンネル）
  *   GOOGLE_SERVICE_ACCOUNT_JSON: Service Account の JSON 全文
  *   GOOGLE_SHEETS_ID           : スプレッドシート ID
  *   GOOGLE_DRIVE_FOLDER_ID     : Drive ルートフォルダ ID
  *   PORT                       : Railway が自動設定
  *
- * Phase 3 変更点:
- *   - 全テキストメッセージを Dify に送り、11カテゴリに自動分類
- *   - action: ignore / notify_slack / log_structured / notify_and_log で分岐
- *   - カテゴリ別に専用 Sheets シートへ構造化ログを書き込む
- *   - Slack 通知はカテゴリ・緊急度に応じたリッチフォーマット
- *   - グループへの返信は原則なし（情報収集・ホウレンソウ自動化に徹する）
+ * v3.1 変更点 (Dify → Gemini Direct):
+ *   - Dify Cloud（200回/月無料）→ Gemini 2.0 Flash（1,500回/日無料）に移行
+ *   - 事前NOISEフィルタ（挨拶・返事）でAPI呼び出しを約30%削減
+ *   - コスト: 月~$64 → 月~$5（Railway のみ）
  *
  * 構造化ログシート:
  *   - 出退勤   : ATTENDANCE
@@ -36,11 +34,96 @@ app.use(express.json());
 
 // ── 1. 環境変数 ──
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-const DIFY_API_KEY      = process.env.DIFY_API_KEY;
-const DIFY_BASE_URL     = 'https://api.dify.ai/v1';
+const GEMINI_API_KEY    = process.env.GEMINI_API_KEY;
+const GEMINI_URL        = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const SHEETS_ID         = process.env.GOOGLE_SHEETS_ID;
 const DRIVE_ROOT_FOLDER = process.env.GOOGLE_DRIVE_FOLDER_ID;
+
+// ── 1-a. Gemini システムプロンプト（メッセージ分類用） ──
+const GEMINI_SYSTEM_PROMPT = `あなたは宿泊施設運営のLINEグループメッセージを自動分類するAIです。
+
+## 役割
+入力されたメッセージを分析し、カテゴリ・緊急度・アクション・構造化データをJSON形式のみで出力してください。
+説明文・前置き・補足は一切不要です。JSONのみを返してください。
+
+## 入力形式
+[グループ: グループ名] [送信者: 表示名]
+メッセージ本文
+
+## 出力スキーマ
+{"category":"カテゴリ名","subcategory":"サブカテゴリ名","urgency":"critical|high|medium|low|none","action":"ignore|notify_slack|log_structured|notify_and_log","summary":"日本語で1〜2行の要約","structured_data":{}}
+
+## カテゴリ一覧と判定ルール（優先度順）
+
+### 1. NOISE（最優先で除外）→ action: ignore
+以下のいずれかに該当するメッセージ:
+- 実質的な情報を含まない挨拶・返事のみ（「お疲れ様です」「承知しました」「ありがとうございます」「かしこまりました」「了解です」「ご対応ありがとうございます」などのみで構成されるメッセージ）
+- スタンプ
+- 「〇〇が退勤します」に対する「お疲れ様でした！」だけの返信
+subcategory: greeting | acknowledgment | sticker
+structured_data: {}
+
+### 2. FACILITY_ISSUE（設備不具合） → action: notify_and_log
+キーワード: 故障、壊れ、動かない、電源入らない、詰まり、漏電、水漏れ、破損、折れ、割れ、異音、異臭、稼働しない、使えない、ブレーカー、ポンプ
+subcategory: urgent | safety_risk | malfunction | degradation
+緊急度: critical=漏電/水漏れ/ガス/火災リスク/「至急」含む, high=機器の完全停止, medium=部分損傷, low=軽微
+structured_data: {"equipment":"対象設備名","location":"場所","symptom":"症状","has_image":true|false}
+
+### 3. ATTENDANCE（出退勤） → action: log_structured
+パターン: 「XX:XX業務開始します」「退勤します」「待機しています」「施錠確認し帰ります」
+subcategory: clock_in | clock_out | standby
+urgency: low
+structured_data: {"type":"clock_in|clock_out|standby","time":"11:00","note":""}
+
+### 4. CHARGE（課金報告） → action: log_structured / 修正時は notify_and_log
+キーワード: 「課金」を含む
+subcategory: charge_report | charge_correction
+urgency: medium
+structured_data: {"items":[{"name":"コーラ","quantity":3}],"is_correction":false,"correction_detail":null}
+
+### 5. INVENTORY（在庫・備品） → action: notify_and_log
+キーワード: 残り〇〇、在庫、発注、注文依頼、納品、賞味期限
+subcategory: stock_alert | order_request | delivery_update
+urgency: high（在庫アラート）/ medium（発注・納品）
+structured_data: {"item":"品目名","remaining":206,"unit":"足","expiry_date":"2026-01-13"}
+
+### 6. BOOKING（予約・ゲスト情報） → action: notify_and_log
+キーワード: アウトイン、チェックイン、宿泊、〇名、〇泊、アウト清掃
+structured_data: {"check_in_date":"2026-04-04","nights":2,"guests":6,"special_requests":[]}
+
+### 7. LOST_FOUND（忘れ物） → action: notify_and_log
+キーワード: 忘れ物、落とし物、置き忘れ
+structured_data: {"item":"品目","status":"found|searching|shipped|returned"}
+
+### 8. CLEANING（清掃作業） → action: log_structured / 問題あり時はnotify_and_log
+subcategory: start_report | end_report | issue_report
+structured_data: {}
+
+### 9. SHIFT（シフト） → action: log_structured / スタッフ不足時はnotify_and_log
+subcategory: schedule_share | schedule_request | shortage
+structured_data: {}
+
+### 10. PENDING_LIST（懸案事項） → action: notify_and_log
+パターン: 番号付きリスト（①②③）/ 「懸案事項」「設備点検」
+subcategory: issue_list | inspection_report
+urgency: high
+structured_data: {}
+
+### 11. QUESTION（確認・質問） → action: log_structured / エスカレ時はnotify_and_log
+subcategory: operational | escalation_request
+structured_data: {}
+
+## 絶対に守るルール
+1. 出力はJSONのみ。他のテキストは一切含めない
+2. 画像のみのメッセージ → category: NOISE, action: ignore
+3. 「課金」を含む場合は必ず品目・数量を分解してitemsに格納する
+4. ATTENDANCEの時刻は必ずHH:MM形式で抽出する
+5. summaryは必ず日本語で記述する
+6. urgencyはcritical/high/medium/low/noneのいずれかのみ`;
+
+// ── 1-b. 事前NOISEフィルタ（Gemini呼び出し削減、約30%効果） ──
+const NOISE_REGEX = /^(お疲れ様|おつかれ様|お疲れ様です|おつかれさまです|おつかれ|承知しました|承知いたしました|承知です|かしこまりました|かしこまりです|ありがとうございます|ありがとうございました|ご対応ありがとう|了解です|了解しました|了解いたしました|わかりました|はい、|はーい|よろしくお願いします).{0,20}$/u;
 
 // シート名定義
 const SHEETS = {
@@ -194,14 +277,19 @@ app.post('/', async (req, res) => {
 
 // ── 7. AI判断 + アクション分岐（Phase 3 v2） ──
 async function handleAiDecision(text, replyToken, groupName, displayName, userId, messageId, driveUrl) {
-  // Dify にコンテキスト付きで送信
+  // 事前NOISEフィルタ: 挨拶・返事のみのメッセージはGemini呼び出しをスキップ
+  if (NOISE_REGEX.test(text.trim())) {
+    console.log(`[AI] 事前フィルタでNOISE判定: "${text.substring(0, 40)}"`);
+    return;
+  }
+
+  // Gemini にコンテキスト付きで送信
   const contextText = `[グループ: ${groupName}] [送信者: ${displayName}]\n${text}`;
-  const rawResponse = await callDify(contextText, userId);
+  const rawResponse = await callGemini(contextText);
 
   let decision;
   try {
-    const cleaned = rawResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    decision = JSON.parse(cleaned);
+    decision = JSON.parse(rawResponse);
   } catch {
     console.warn('[AI] JSON parse 失敗。フォールバック（ignore）:', rawResponse.substring(0, 80));
     decision = { action: 'ignore' };
@@ -537,21 +625,23 @@ async function getGroupName(groupId, sourceType) {
   return nameCache[groupId];
 }
 
-// ── 14. Dify API ──
-async function callDify(message, userId) {
-  const res = await fetch(DIFY_BASE_URL + '/chat-messages', {
+// ── 14. Gemini API（Dify の代替、無料枠: 1,500 req/日） ──
+async function callGemini(message) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY が未設定です');
+  const res = await fetch(`${GEMINI_URL}?key=${GEMINI_API_KEY}`, {
     method: 'POST',
-    headers: { Authorization: 'Bearer ' + DIFY_API_KEY, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      inputs: {},
-      query: message,
-      response_mode: 'blocking',
-      user: userId || 'anonymous',
+      system_instruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
+      contents: [{ parts: [{ text: message }] }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: 512 },
     }),
   });
-  if (!res.ok) throw new Error(`Dify: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`Gemini: ${res.status} ${await res.text()}`);
   const data = await res.json();
-  return data.answer || '{}';
+  const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  // マークダウンコードブロックを除去
+  return raw.replace(/```json\n?|\n?```/g, '').trim();
 }
 
 // ── 15. LINE 返信（グループ返信は原則使わない・将来の拡張用） ──

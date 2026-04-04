@@ -16,6 +16,12 @@
 const SPREADSHEET_ID   = 'YOUR_SPREADSHEET_ID'; // Google SheetsのID
 const SLACK_WEBHOOK_URL = 'YOUR_SLACK_WEBHOOK_URL'; // Slack Incoming Webhook URL
 
+// Gemini APIキー: GASエディタ > プロジェクト設定 > スクリプトプロパティ に
+// キー名 "GEMINI_API_KEY" で設定することを推奨（コードに直書きしない）
+function getGeminiApiKey() {
+  return PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY') || '';
+}
+
 // シート名（index.js と合わせること）
 const SHEET = {
   ATTEND:   '出退勤',
@@ -116,7 +122,17 @@ function sendDailySummary() {
   }
 
   lines.push('\n━━━━━━━━━━━━━━━━━━');
-  lines.push(`_集計時刻: ${getJstTimestamp()} | YAMATO AI Bot v3_`);
+
+  // AI総評（Gemini）
+  const rawData = { attendance, facilities, charges, lostItems, inventories, date: today };
+  const aiSummary = generateAiSummary(rawData, today);
+  if (aiSummary) {
+    lines.push('\n🤖 *AI総評*');
+    lines.push(aiSummary);
+    lines.push('━━━━━━━━━━━━━━━━━━');
+  }
+
+  lines.push(`_集計時刻: ${getJstTimestamp()} | YAMATO AI Bot v3.1_`);
 
   const text = lines.join('\n');
 
@@ -181,6 +197,60 @@ function getDayOfWeek() {
 function getJstTimestamp() {
   const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
   return Utilities.formatDate(d, 'UTC', 'yyyy-MM-dd HH:mm');
+}
+
+// ── AI総評: Gemini で自然言語サマリー生成 ──
+function generateAiSummary(rawData, today) {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    Logger.log('GEMINI_API_KEY が未設定のためAI総評をスキップ');
+    return '';
+  }
+
+  // 集計データを要約してプロンプト作成
+  const attendance  = rawData.attendance  || [];
+  const facilities  = rawData.facilities  || [];
+  const charges     = rawData.charges     || [];
+  const lostItems   = rawData.lostItems   || [];
+  const inventories = rawData.inventories || [];
+
+  const summary = {
+    date: today,
+    staff_count: new Set(attendance.filter(r => r['種別'] === 'clock_in').map(r => r['スタッフ名'])).size,
+    no_clockout: attendance
+      .filter(r => r['種別'] === 'clock_in')
+      .map(r => r['スタッフ名'])
+      .filter(n => !attendance.some(r => r['種別'] === 'clock_out' && r['スタッフ名'] === n)),
+    facility_issues: facilities.map(r => ({
+      equipment: r['対象設備'], urgency: r['緊急度'], status: r['ステータス']
+    })),
+    open_facility_count: facilities.filter(r => r['ステータス'] === 'open').length,
+    charges: charges.map(r => ({ item: r['品目'], qty: r['数量'] })),
+    lost_items: lostItems.map(r => ({ item: r['品目'], status: r['ステータス'] })),
+    inventory_alerts: inventories.map(r => ({ item: r['品目'], remaining: r['残数'], unit: r['単位'] })),
+  };
+
+  const prompt = `あなたは宿泊施設運営の日次レポートアシスタントです。\n以下の${today}の運営データをもとに、日本語で自然な日次総評を150字以内で作成してください。\n特に重要な問題・未対応リスク・翌日への申し送り事項を優先して強調してください。データ:\n${JSON.stringify(summary, null, 0)}`;
+
+  try {
+    const res = UrlFetchApp.fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
+        }),
+        muteHttpExceptions: true,
+      }
+    );
+    const data = JSON.parse(res.getContentText());
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  } catch (e) {
+    Logger.log(`generateAiSummary エラー: ${e.message}`);
+    return '';
+  }
 }
 
 // ── 手動テスト用（GASエディタから直接実行してSlack通知をテスト） ──
