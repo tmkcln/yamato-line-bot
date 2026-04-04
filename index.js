@@ -1,28 +1,22 @@
 /**
- * YAMATO AI Bot — Railway版 (Express) v3.1
+ * YAMATO AI Bot — Railway版 (Express) v4.0
  *
- * 構成: LINE Webhook → Railway → Google Sheets/Drive 収集 + Gemini AI分類 + Slack通知
+ * 構成:
+ *   Pass 1（リアルタイム）: LINE Webhook → 全量RAWログ + 緊急キーワード検知 → Slack即時アラート
+ *   Pass 2+3（21:00バッチ）: GAS DailySummary.gs がスレッド化 + Gemini分析 + Slackサマリー
  *
  * 環境変数（Railway Dashboard で設定）:
  *   LINE_ACCESS_TOKEN          : LINE Channel Access Token
- *   GEMINI_API_KEY             : Google Gemini API キー（aistudio.google.com で取得）
- *   SLACK_WEBHOOK_URL          : Slack Incoming Webhook URL（1チャンネル）
+ *   SLACK_WEBHOOK_URL          : Slack Incoming Webhook URL
  *   GOOGLE_SERVICE_ACCOUNT_JSON: Service Account の JSON 全文
  *   GOOGLE_SHEETS_ID           : スプレッドシート ID
  *   GOOGLE_DRIVE_FOLDER_ID     : Drive ルートフォルダ ID
  *   PORT                       : Railway が自動設定
  *
- * v3.1 変更点 (Dify → Gemini Direct):
- *   - Dify Cloud（200回/月無料）→ Gemini 2.0 Flash（1,500回/日無料）に移行
- *   - 事前NOISEフィルタ（挨拶・返事）でAPI呼び出しを約30%削減
- *   - コスト: 月~$64 → 月~$5（Railway のみ）
- *
- * 構造化ログシート:
- *   - 出退勤   : ATTENDANCE
- *   - 設備不具合: FACILITY_ISSUE
- *   - 課金     : CHARGE
- *   - 忘れ物   : LOST_FOUND
- *   - 在庫     : INVENTORY
+ * v4.0 変更点:
+ *   - リアルタイムGemini呼び出しを廃止（1件ずつ分類 → コスト削減・レイテンシ改善）
+ *   - 緊急キーワード（漏電/水漏れ/火災等）のみ正規表現で即時Slack通知
+ *   - AI分類・構造化ログ・日次サマリーは DailySummary.gs（21:00）が一括処理
  */
 
 const express = require('express');
@@ -34,105 +28,18 @@ app.use(express.json());
 
 // ── 1. 環境変数 ──
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-const GEMINI_API_KEY    = process.env.GEMINI_API_KEY;
-const GEMINI_URL        = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const SHEETS_ID         = process.env.GOOGLE_SHEETS_ID;
 const DRIVE_ROOT_FOLDER = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-// ── 1-a. Gemini システムプロンプト（メッセージ分類用） ──
-const GEMINI_SYSTEM_PROMPT = `あなたは宿泊施設運営のLINEグループメッセージを自動分類するAIです。
-
-## 役割
-入力されたメッセージを分析し、カテゴリ・緊急度・アクション・構造化データをJSON形式のみで出力してください。
-説明文・前置き・補足は一切不要です。JSONのみを返してください。
-
-## 入力形式
-[グループ: グループ名] [送信者: 表示名]
-メッセージ本文
-
-## 出力スキーマ
-{"category":"カテゴリ名","subcategory":"サブカテゴリ名","urgency":"critical|high|medium|low|none","action":"ignore|notify_slack|log_structured|notify_and_log","summary":"日本語で1〜2行の要約","structured_data":{}}
-
-## カテゴリ一覧と判定ルール（優先度順）
-
-### 1. NOISE（最優先で除外）→ action: ignore
-以下のいずれかに該当するメッセージ:
-- 実質的な情報を含まない挨拶・返事のみ（「お疲れ様です」「承知しました」「ありがとうございます」「かしこまりました」「了解です」「ご対応ありがとうございます」などのみで構成されるメッセージ）
-- スタンプ
-- 「〇〇が退勤します」に対する「お疲れ様でした！」だけの返信
-subcategory: greeting | acknowledgment | sticker
-structured_data: {}
-
-### 2. FACILITY_ISSUE（設備不具合） → action: notify_and_log
-キーワード: 故障、壊れ、動かない、電源入らない、詰まり、漏電、水漏れ、破損、折れ、割れ、異音、異臭、稼働しない、使えない、ブレーカー、ポンプ
-subcategory: urgent | safety_risk | malfunction | degradation
-緊急度: critical=漏電/水漏れ/ガス/火災リスク/「至急」含む, high=機器の完全停止, medium=部分損傷, low=軽微
-structured_data: {"equipment":"対象設備名","location":"場所","symptom":"症状","has_image":true|false}
-
-### 3. ATTENDANCE（出退勤） → action: log_structured
-パターン: 「XX:XX業務開始します」「退勤します」「待機しています」「施錠確認し帰ります」
-subcategory: clock_in | clock_out | standby
-urgency: low
-structured_data: {"type":"clock_in|clock_out|standby","time":"11:00","note":""}
-
-### 4. CHARGE（課金報告） → action: log_structured / 修正時は notify_and_log
-キーワード: 「課金」を含む
-subcategory: charge_report | charge_correction
-urgency: medium
-structured_data: {"items":[{"name":"コーラ","quantity":3}],"is_correction":false,"correction_detail":null}
-
-### 5. INVENTORY（在庫・備品） → action: notify_and_log
-キーワード: 残り〇〇、在庫、発注、注文依頼、納品、賞味期限
-subcategory: stock_alert | order_request | delivery_update
-urgency: high（在庫アラート）/ medium（発注・納品）
-structured_data: {"item":"品目名","remaining":206,"unit":"足","expiry_date":"2026-01-13"}
-
-### 6. BOOKING（予約・ゲスト情報） → action: notify_and_log
-キーワード: アウトイン、チェックイン、宿泊、〇名、〇泊、アウト清掃
-structured_data: {"check_in_date":"2026-04-04","nights":2,"guests":6,"special_requests":[]}
-
-### 7. LOST_FOUND（忘れ物） → action: notify_and_log
-キーワード: 忘れ物、落とし物、置き忘れ
-structured_data: {"item":"品目","status":"found|searching|shipped|returned"}
-
-### 8. CLEANING（清掃作業） → action: log_structured / 問題あり時はnotify_and_log
-subcategory: start_report | end_report | issue_report
-structured_data: {}
-
-### 9. SHIFT（シフト） → action: log_structured / スタッフ不足時はnotify_and_log
-subcategory: schedule_share | schedule_request | shortage
-structured_data: {}
-
-### 10. PENDING_LIST（懸案事項） → action: notify_and_log
-パターン: 番号付きリスト（①②③）/ 「懸案事項」「設備点検」
-subcategory: issue_list | inspection_report
-urgency: high
-structured_data: {}
-
-### 11. QUESTION（確認・質問） → action: log_structured / エスカレ時はnotify_and_log
-subcategory: operational | escalation_request
-structured_data: {}
-
-## 絶対に守るルール
-1. 出力はJSONのみ。他のテキストは一切含めない
-2. 画像のみのメッセージ → category: NOISE, action: ignore
-3. 「課金」を含む場合は必ず品目・数量を分解してitemsに格納する
-4. ATTENDANCEの時刻は必ずHH:MM形式で抽出する
-5. summaryは必ず日本語で記述する
-6. urgencyはcritical/high/medium/low/noneのいずれかのみ`;
-
-// ── 1-b. 事前NOISEフィルタ（Gemini呼び出し削減、約30%効果） ──
-const NOISE_REGEX = /^(お疲れ様|おつかれ様|お疲れ様です|おつかれさまです|おつかれ|承知しました|承知いたしました|承知です|かしこまりました|かしこまりです|ありがとうございます|ありがとうございました|ご対応ありがとう|了解です|了解しました|了解いたしました|わかりました|はい、|はーい|よろしくお願いします).{0,20}$/u;
+// ── 1-a. 緊急キーワード検知（リアルタイムSlack即時アラート用）
+// 生命・安全に関わるものだけを対象。AI不要で正規表現で確実に検知する。
+const CRITICAL_REGEX = /漏電|水漏れ|ガス漏れ|火災|煙が出|燃えて|倒れ|骨折|怪我|救急|119番|意識|至急.{0,5}(危|緊急|危険)|緊急.{0,5}(来て|対応|助)/u;
 
 // シート名定義
 const SHEETS = {
-  LOG:      'メッセージログ',
-  ATTEND:   '出退勤',
-  FACILITY: '設備不具合',
-  CHARGE:   '課金',
-  LOST:     '忘れ物',
-  INVENTORY:'在庫',
+  LOG: 'メッセージログ',  // index.jsが書き込む唯一のシート（全量RAWログ）
+  // 構造化シート（THREAD_LOG含む）は DailySummary.gs が管理
 };
 
 // ── 2. Google Auth ──
@@ -151,57 +58,28 @@ const nameCache = {};
 // ── 4. ヘルスチェック ──
 app.get('/', (req, res) => res.send('YAMATO AI Bot v3 OK'));
 
-// ── 5. 起動時: 全シートヘッダー初期化 ──
+// ── 5. 起動時: メッセージログシートのヘッダー初期化 ──
 async function initAllSheetHeaders() {
   const sheets = google.sheets({ version: 'v4', auth });
+  const headers = ['日時', 'グループID', 'グループ名', 'ユーザーID', '表示名', '種別', 'テキスト', 'DriveURL', 'messageId'];
 
-  const defs = [
-    {
-      name: SHEETS.LOG,
-      headers: ['日時', 'グループID', 'グループ名', 'ユーザーID', '表示名', '種別', 'テキスト', 'DriveURL', 'messageId'],
-    },
-    {
-      name: SHEETS.ATTEND,
-      headers: ['日付', 'スタッフ名', '種別', '時刻', '備考', 'messageId'],
-    },
-    {
-      name: SHEETS.FACILITY,
-      headers: ['報告日時', '報告者', '対象設備', '場所', '症状', '緊急度', 'ステータス', '画像URL', 'messageId'],
-    },
-    {
-      name: SHEETS.CHARGE,
-      headers: ['報告日時', '報告者', '品目', '数量', '修正フラグ', '修正内容', 'messageId'],
-    },
-    {
-      name: SHEETS.LOST,
-      headers: ['報告日時', '報告者', '品目', 'ステータス', '画像URL', 'messageId'],
-    },
-    {
-      name: SHEETS.INVENTORY,
-      headers: ['報告日時', '報告者', '品目', '残数', '単位', '賞味期限', '発注ステータス', 'messageId'],
-    },
-  ];
-
-  for (const def of defs) {
-    try {
-      const range = `${def.name}!A1:${String.fromCharCode(64 + def.headers.length)}1`;
-      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEETS_ID, range });
-      const row1 = res.data.values?.[0];
-      if (!row1 || row1[0] !== def.headers[0]) {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: SHEETS_ID,
-          range,
-          valueInputOption: 'USER_ENTERED',
-          resource: { values: [def.headers] },
-        });
-        console.log(`[INIT] ${def.name} ヘッダー書き込み済み`);
-      } else {
-        console.log(`[INIT] ${def.name} ヘッダー確認済み`);
-      }
-    } catch (err) {
-      // シートが存在しない場合はエラーになるが、appendToStructuredSheet が初回書き込み時に対応
-      console.warn(`[INIT] ${def.name} シートが見つかりません（要手動作成）: ${err.message}`);
+  try {
+    const range = `${SHEETS.LOG}!A1:I1`;
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEETS_ID, range });
+    const row1 = res.data.values?.[0];
+    if (!row1 || row1[0] !== headers[0]) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEETS_ID,
+        range,
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: [headers] },
+      });
+      console.log(`[INIT] ${SHEETS.LOG} ヘッダー書き込み済み`);
+    } else {
+      console.log(`[INIT] ${SHEETS.LOG} ヘッダー確認済み`);
     }
+  } catch (err) {
+    console.warn(`[INIT] ${SHEETS.LOG} シートが見つかりません: ${err.message}`);
   }
 }
 
@@ -265,9 +143,9 @@ app.post('/', async (req, res) => {
 
       console.log(`[LOG] ${displayName}(${groupName}): ${text.substring(0, 60)}`);
 
-      // テキストメッセージのみ AI 判断（Phase 3）
+      // テキストメッセージのみ緊急キーワード検知（AI不使用・即時アラート）
       if (msg.type === 'text' && text) {
-        await handleAiDecision(text, replyToken, groupName, displayName, userId, msg.id, driveUrl);
+        await checkCriticalAlert(text, groupName, displayName);
       }
     } catch (err) {
       console.error(`[ERROR] ${err.message}`);
@@ -275,239 +153,39 @@ app.post('/', async (req, res) => {
   }
 });
 
-// ── 7. AI判断 + アクション分岐（Phase 3 v2） ──
-async function handleAiDecision(text, replyToken, groupName, displayName, userId, messageId, driveUrl) {
-  // 事前NOISEフィルタ: 挨拶・返事のみのメッセージはGemini呼び出しをスキップ
-  if (NOISE_REGEX.test(text.trim())) {
-    console.log(`[AI] 事前フィルタでNOISE判定: "${text.substring(0, 40)}"`);
-    return;
-  }
+// ── 7. 緊急キーワード即時アラート（AI不使用）──
+// 生命・安全に関わる緊急事態のみ正規表現で即時検知しSlack通知する。
+// 通常の設備不具合・業務報告はDailySummary.gs（21:00バッチ）が処理する。
+async function checkCriticalAlert(text, groupName, senderName) {
+  if (!CRITICAL_REGEX.test(text)) return;
 
-  // Gemini にコンテキスト付きで送信
-  const contextText = `[グループ: ${groupName}] [送信者: ${displayName}]\n${text}`;
-  const rawResponse = await callGemini(contextText);
+  console.log(`[CRITICAL] 緊急キーワード検知: "${text.substring(0, 60)}"`);
 
-  let decision;
-  try {
-    decision = JSON.parse(rawResponse);
-  } catch {
-    console.warn('[AI] JSON parse 失敗。フォールバック（ignore）:', rawResponse.substring(0, 80));
-    decision = { action: 'ignore' };
-  }
-
-  const action   = decision.action   || 'ignore';
-  const category = decision.category || 'UNKNOWN';
-  const urgency  = decision.urgency  || 'low';
-
-  console.log(`[AI] action=${action} category=${category} urgency=${urgency}`);
-
-  // 画像URLをstructured_dataに付与（直前の画像メッセージと紐付けは将来課題）
-  if (decision.structured_data && driveUrl) {
-    decision.structured_data.image_url = driveUrl;
-  }
-
-  // アクション分岐
-  switch (action) {
-    case 'notify_slack':
-      await notifySlack(decision, displayName, groupName);
-      break;
-
-    case 'log_structured':
-      await writeStructuredLog(decision, displayName, messageId);
-      break;
-
-    case 'notify_and_log':
-      await notifySlack(decision, displayName, groupName);
-      await writeStructuredLog(decision, displayName, messageId);
-      break;
-
-    case 'reply':
-      // グループ返信は原則使わないが、将来の拡張のために残す
-      if (decision.reply_text && replyToken) {
-        await replyToLine(replyToken, decision.reply_text);
-      }
-      break;
-
-    case 'ignore':
-    default:
-      // 何もしない
-      break;
-  }
-}
-
-// ── 8. Slack 通知（カテゴリ別リッチフォーマット） ──
-async function notifySlack(decision, senderName, groupName) {
   if (!SLACK_WEBHOOK_URL) {
     console.warn('[Slack] SLACK_WEBHOOK_URL が未設定です');
     return;
   }
 
-  const category = decision.category || 'UNKNOWN';
-  const urgency  = decision.urgency  || 'low';
-  const summary  = decision.summary  || '';
-  const sd       = decision.structured_data || {};
-
-  // 緊急度ごとのアイコン
-  const urgencyEmoji = {
-    critical: '🚨',
-    high:     '⚠️',
-    medium:   '📋',
-    low:      'ℹ️',
-    none:     '📌',
-  }[urgency] || '📌';
-
-  // カテゴリごとにヘッダーラベルを設定
-  const categoryLabel = {
-    FACILITY_ISSUE: '設備不具合',
-    ATTENDANCE:     '出退勤',
-    CHARGE:         '課金報告',
-    CLEANING:       '清掃報告',
-    BOOKING:        '予約・ゲスト情報',
-    LOST_FOUND:     '忘れ物',
-    INVENTORY:      '在庫アラート',
-    SHIFT:          'シフト',
-    PENDING_LIST:   '懸案事項',
-    QUESTION:       '確認・質問',
-    NOISE:          'その他',
-  }[category] || category;
-
-  // メッセージ本文を構築
-  let lines = [
-    `${urgencyEmoji} *[${categoryLabel}]* | ${groupName}`,
+  const lines = [
+    `🚨 *[緊急アラート]* | ${groupName}`,
     `*報告者:* ${senderName}`,
-    `*内容:* ${summary}`,
+    `*内容:* ${text.substring(0, 200)}`,
+    `_${getJstTimestamp()} — 自動キーワード検知_`,
   ];
-
-  // カテゴリ固有の追加情報
-  if (category === 'FACILITY_ISSUE' && sd.equipment) {
-    lines.push(`*対象設備:* ${sd.equipment}${sd.location ? ' (' + sd.location + ')' : ''}`);
-    lines.push(`*緊急度:* ${urgency.toUpperCase()}`);
-  }
-  if (category === 'INVENTORY' && sd.item) {
-    lines.push(`*品目:* ${sd.item} 残${sd.remaining || '?'}${sd.unit || ''}`);
-    if (sd.expiry_date) lines.push(`*賞味期限:* ${sd.expiry_date}`);
-  }
-  if (category === 'BOOKING' && sd.guests) {
-    lines.push(`*人数:* ${sd.guests}名 / ${sd.nights || '?'}泊`);
-    if (sd.special_requests?.length) lines.push(`*特記:* ${sd.special_requests.join('・')}`);
-  }
-  if (category === 'LOST_FOUND' && sd.item) {
-    lines.push(`*品目:* ${sd.item} (${sd.status || '不明'})`);
-  }
-  if (category === 'CHARGE' && sd.items?.length) {
-    const itemList = sd.items.map(i => `${i.name} x${i.quantity}`).join('、');
-    lines.push(`*品目:* ${itemList}`);
-    if (sd.is_correction) lines.push('*⚠️ 修正あり*');
-  }
-
-  lines.push(`_${getJstTimestamp()}_`);
-
-  const slackText = lines.join('\n');
 
   const res = await fetch(SLACK_WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: slackText }),
+    body: JSON.stringify({ text: lines.join('\n') }),
   });
 
-  if (!res.ok) console.error('[Slack] 通知失敗:', res.status);
-  else console.log(`[Slack] 通知送信: ${category}/${urgency}`);
+  if (!res.ok) console.error('[Slack] 緊急通知失敗:', res.status);
+  else console.log('[Slack] 緊急アラート送信済み');
 }
 
-// ── 9. 構造化ログ書き込み ──
-async function writeStructuredLog(decision, senderName, messageId) {
-  const category = decision.category;
-  const sd       = decision.structured_data || {};
-  const ts       = getJstTimestamp();
-  const date     = ts.substring(0, 10);
-
-  switch (category) {
-    case 'ATTENDANCE': {
-      // 出退勤シート: 日付 | スタッフ名 | 種別 | 時刻 | 備考 | messageId
-      await appendToSheet(SHEETS.ATTEND, [
-        date,
-        senderName,
-        sd.type || '',
-        sd.time || '',
-        sd.note || '',
-        messageId,
-      ]);
-      console.log(`[LOG] 出退勤記録: ${senderName} ${sd.type} ${sd.time}`);
-      break;
-    }
-
-    case 'FACILITY_ISSUE': {
-      // 設備不具合シート: 報告日時 | 報告者 | 対象設備 | 場所 | 症状 | 緊急度 | ステータス | 画像URL | messageId
-      await appendToSheet(SHEETS.FACILITY, [
-        ts,
-        senderName,
-        sd.equipment || '',
-        sd.location  || '',
-        sd.symptom   || decision.summary || '',
-        decision.urgency || '',
-        'open',
-        sd.image_url || '',
-        messageId,
-      ]);
-      console.log(`[LOG] 設備不具合記録: ${sd.equipment}`);
-      break;
-    }
-
-    case 'CHARGE': {
-      // 課金シート: 報告日時 | 報告者 | 品目 | 数量 | 修正フラグ | 修正内容 | messageId
-      // 品目が複数ある場合は1品目1行に分割
-      const items = sd.items || [{ name: decision.summary || '不明', quantity: '' }];
-      for (const item of items) {
-        await appendToSheet(SHEETS.CHARGE, [
-          ts,
-          senderName,
-          item.name || '',
-          item.quantity !== undefined ? item.quantity : '',
-          sd.is_correction ? 'TRUE' : 'FALSE',
-          sd.correction_detail || '',
-          messageId,
-        ]);
-      }
-      console.log(`[LOG] 課金記録: ${items.map(i => i.name + ' x' + i.quantity).join(', ')}`);
-      break;
-    }
-
-    case 'LOST_FOUND': {
-      // 忘れ物シート: 報告日時 | 報告者 | 品目 | ステータス | 画像URL | messageId
-      await appendToSheet(SHEETS.LOST, [
-        ts,
-        senderName,
-        sd.item   || decision.summary || '',
-        sd.status || 'found',
-        sd.image_url || '',
-        messageId,
-      ]);
-      console.log(`[LOG] 忘れ物記録: ${sd.item}`);
-      break;
-    }
-
-    case 'INVENTORY': {
-      // 在庫シート: 報告日時 | 報告者 | 品目 | 残数 | 単位 | 賞味期限 | 発注ステータス | messageId
-      await appendToSheet(SHEETS.INVENTORY, [
-        ts,
-        senderName,
-        sd.item        || '',
-        sd.remaining   !== undefined ? sd.remaining : '',
-        sd.unit        || '',
-        sd.expiry_date || '',
-        'alert',
-        messageId,
-      ]);
-      console.log(`[LOG] 在庫記録: ${sd.item} 残${sd.remaining}${sd.unit}`);
-      break;
-    }
-
-    default:
-      // CLEANING, SHIFT, BOOKING, QUESTION, PENDING_LIST はメッセージログのみ（追加シートなし）
-      console.log(`[LOG] 構造化シートなし（${category}）: メッセージログのみ`);
-      break;
-  }
-}
+// ── 8. (削除) ──
+// notifySlack / writeStructuredLog / callGemini はv4.0で廃止。
+// AI分類と構造化ログ書き込みは DailySummary.gs（21:00バッチ）に移管。
 
 // ── 10. Sheets汎用追記 ──
 async function appendToSheet(sheetName, row) {
@@ -630,36 +308,7 @@ async function getGroupName(groupId, sourceType) {
   return nameCache[groupId];
 }
 
-// ── 14. Gemini API（Dify の代替、無料枠: 1,500 req/日） ──
-async function callGemini(message) {
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY が未設定です');
-  const res = await fetch(`${GEMINI_URL}?key=${GEMINI_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
-      contents: [{ parts: [{ text: message }] }],
-      generationConfig: { temperature: 0.1, maxOutputTokens: 512 },
-    }),
-  });
-  if (!res.ok) throw new Error(`Gemini: ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  // マークダウンコードブロックを除去
-  return raw.replace(/```json\n?|\n?```/g, '').trim();
-}
-
-// ── 15. LINE 返信（グループ返信は原則使わない・将来の拡張用） ──
-async function replyToLine(replyToken, text) {
-  const res = await fetch('https://api.line.me/v2/bot/message/reply', {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + LINE_ACCESS_TOKEN, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text: text.substring(0, 5000) }] }),
-  });
-  if (!res.ok) throw new Error(`LINE reply: ${res.status} ${await res.text()}`);
-}
-
-// ── 16. ユーティリティ ──
+// ── 14. ユーティリティ ──
 function getJstTimestamp() {
   return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().replace('T', ' ').substring(0, 19);
 }
