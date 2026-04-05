@@ -31,6 +31,7 @@ const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const SHEETS_ID         = process.env.GOOGLE_SHEETS_ID;
 const DRIVE_ROOT_FOLDER = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const HQ_USER_IDS       = (process.env.HQ_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // ── 1-a. 緊急キーワード検知（リアルタイムSlack即時アラート用）
 // 生命・安全に関わるものだけを対象。AI不要で正規表現で確実に検知する。
@@ -101,10 +102,10 @@ app.get('/', (req, res) => res.send('YAMATO AI Bot v3 OK'));
 // ── 5. 起動時: メッセージログシートのヘッダー初期化 ──
 async function initAllSheetHeaders() {
   const sheets = google.sheets({ version: 'v4', auth });
-  const headers = ['日時', 'グループID', 'グループ名', 'ユーザーID', '表示名', '種別', 'テキスト', 'DriveURL', 'messageId'];
+  const headers = ['日時', 'グループID', 'グループ名', 'ユーザーID', '表示名', '種別', 'テキスト', 'DriveURL', 'messageId', 'is_hq'];
 
   try {
-    const range = `${SHEETS.LOG}!A1:I1`;
+    const range = `${SHEETS.LOG}!A1:J1`;
     const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEETS_ID, range });
     const row1 = res.data.values?.[0];
     if (!row1 || row1[0] !== headers[0]) {
@@ -169,6 +170,7 @@ app.post('/', async (req, res) => {
       }
 
       // メッセージログに全量記録（既存動作を維持）
+      const isHq = HQ_USER_IDS.includes(userId) ? 'TRUE' : 'FALSE';
       await appendToSheet(SHEETS.LOG, [
         getJstTimestamp(),
         groupId || userId,
@@ -179,6 +181,7 @@ app.post('/', async (req, res) => {
         text,
         driveUrl,
         msg.id,
+        isHq,
       ]);
 
       console.log(`[LOG] ${displayName}(${groupName}): ${text.substring(0, 60)}`);
